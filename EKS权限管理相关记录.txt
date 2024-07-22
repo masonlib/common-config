@@ -1,0 +1,146 @@
+要查看哪些插件是被启用的：
+kube-apiserver -h | grep enable-admission-plugins
+
+在 Kubernetes 1.29 中，默认启用的插件有：
+CertificateApproval, CertificateSigning, CertificateSubjectRestriction, DefaultIngressClass, DefaultStorageClass, DefaultTolerationSeconds, LimitRanger, MutatingAdmissionWebhook, NamespaceLifecycle, PersistentVolumeClaimResize, PodSecurity, Priority, ResourceQuota, RuntimeClass, ServiceAccount, StorageObjectInUseProtection, TaintNodesByCondition, ValidatingAdmissionPolicy, ValidatingAdmissionWebhook
+
+
+1.认证实验方式
+
+1.1. x509方式认证实验命令：
+kubectl get pod --user myuser
+
+1.2 基于SA方式的认证实验：
+kubectl get sa default -oyaml
+kubectl get secret <default-token-xxxx>
+echo "<token>" |base64 -d
+
+#访问API URL：
+curl https://192.168.34.2:6443/api/v1/namespaces/default -H "Authorization: Bearer <token>" -k
+
+
+
+最后的练习题：
+1）使用x509方式创建一个用户myuser，允许API Server可以使用该创建的用户进行登录认证。
+
+
+
+2）创建一个名为deployment-clusterrole的clusterrole，该clusterrole只允许对
+Deployment
+Daemonset
+Statefulset
+具有create权限，
+在现有的 namespace app-team中创建一个名为cicd-token的新 ServiceAccount；
+限于 namespace app-team中，将新的ClusterRole deployment-custerrole绑定到新的 ServiceAccount cicd-token。
+
+# 创建clusterrole并赋予其对三种控制器的create权限
+kubectl create clusterrole deployment-clusterrole --verb=create --resource=deployments,statefulsets,daemonsets
+
+
+# 创建 服务账号serviceaccount cicd-token
+kubectl create -n app-team
+kubectl -n app-team create serviceaccount cicd-token
+
+# 创建 rolebinding
+# 题目中写了“限于namespace app-team中”，则创建rolebinding。没有写的话，则创建clusterrolebinding
+# 根据命令格式rolebinding后面cicd-token-rolebinding为角色绑定名称，题目中没有要求可自己定
+kubectl -n app-team create rolebinding cicd-token-rolebinding --clusterrole=deployment-clusterrole --serviceaccount=app-team:cicd-token
+
+#查看绑定描述
+kubectl -n app-team describe rolebinding cicd-token-rolebinding
+#验证服务账号在集群的权限
+kubectl auth can-i create deployment --as system:serviceaccount:app-team:cicd-token
+#验证服务账号在集群app-team命名空间下的权限
+kubectl auth can-i create deployment -n app-team --as system:serviceaccount:app-team:cicd-token
+
+
+
+3）创建一个LimitRanger的资源，设置默认的pod的最小资源限制和请求
+
+
+
+
+
+
+
+
+
+
+1）User
+1、创建K8S 用户
+普通用户并不是通过k8s来创建和维护，是通过创建证书和切换上下文环境的方式来创建和切换用户。
+
+a、创建证书
+
+#　创建私钥
+$ openssl genrsa -out devuser.key 2048
+ 
+#　用此私钥创建一个csr(证书签名请求)文件
+$ openssl req -new -key devuser.key -subj "/CN=devuser" -out devuser.csr
+ 
+#　拿着私钥和请求文件生成证书
+$ openssl x509 -req -in devuser.csr -CA /etc/kubernetes/pki/ca.crt -CAkey /etc/kubernetes/pki/ca.key -CAcreateserial -out devuser.crt -days 365
+b、生成账号
+
+$ kubectl config set-credentials devuser --client-certificate=./devuser.crt --client-key=./devuser.key --embed-certs=true
+c、设置上下文参数
+
+# # 设置上下文， 默认会保存在 $HOME/.kube/config
+$ kubectl config set-context devuser@kubernetes --cluster=kubernetes --user=devuser --namespace=dev
+
+# 查看
+$ kubectl config get-contexts
+图片
+
+d、设置 默认上下文
+
+$ kubectl config use-context devuser@kubernetes
+# 查看
+$ kubectl config get-contexts
+$ kubectl get nodes
+图片
+
+发现使用我们创建的用户查询是失败的，是因为账号还没授权，接下来就是对账号进行授权。这里需要先把用切回来，要不然就无法进行下一步授权了。
+
+$ kubectl config use-context kubernetes-admin@kubernetes
+$ kubectl get nodes
+图片
+
+2、对用户授权
+$ cat >devuser-role-bind<<EOF
+kind: Role  # 角色
+apiVersion: rbac.authorization.k8s.io/v1
+metadata:
+  namespace: dev
+  name: devuser-role
+rules:
+- apiGroups: [""] # ""代表核心api组
+  resources: ["pods"]
+  verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+---
+kind: RoleBinding # 角色绑定
+apiVersion: rbac.authorization.k8s.io/v1
+metadata:
+  name: devuser-rolebinding
+  namespace: dev
+subjects:
+- kind: User
+  name: devuser   # 目标用户
+  apiGroup: rbac.authorization.k8s.io
+roleRef:
+  kind: Role
+  name: devuser-role  # 角色信息
+  apiGroup: rbac.authorization.k8s.io
+EOF
+执行并验证
+
+$ kubectl apply -f devuser-role-bind
+$ kubectl config use-context devuser@kubernetes
+$ kubectl get pods # 不带命名空间，这里默认dev，也只能查看dev上面限制的命名空间的pods资源，从而也验证了role是针对命名空间的权限限制
+#查看其它命名空间的资源
+$ kubectl get pods -n default
+$ kubectl get pods -n kube-system
+$ kubectl get nodes
+图片
+
+可以看到，用devuser，已经可以管理dev命名空间下的pod资源了，也只能管理dev命名空间下的pod资源，无法管理dev以外的资源类型，验证ok。ClusterRoleBinding绑定类似，这里就不重复了。有兴趣的小伙伴可以试试。
